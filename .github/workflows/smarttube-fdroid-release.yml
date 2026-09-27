@@ -1,0 +1,488 @@
+name: build
+
+on:
+  schedule:
+    - cron: 0 0 * * *
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smarttube-fdroid
+  cancel-in-progress: false
+
+env:
+  FDROID_METADATA_URL: https://raw.githubusercontent.com/f-droid/fdroiddata/master/metadata/app.smarttube.fdroid.yml
+  UPSTREAM_REPO: https://github.com/yuliskov/SmartTube.git
+  ANDROID_NDK_VERSION: "21.0.6113669"
+  ANDROID_PLATFORM: "android-34"
+  ANDROID_BUILD_TOOLS: "34.0.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Get local version
+        id: local
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(git tag --list | grep -E '^[0-9]+([.][0-9]+)*$' | sort -V | tail -n 1)"
+
+          if [[ -z "$tag" ]]; then
+            echo "::error::No release tag matching ^[0-9.]+$ was found."
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Get F-Droid metadata
+        id: fdroid
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 2 \
+            --silent \
+            --show-error \
+            "$FDROID_METADATA_URL" \
+            -o "$RUNNER_TEMP/app.smarttube.fdroid.yml"
+
+          ruby -ryaml > "$GITHUB_OUTPUT" <<'RUBY'
+          path = File.join(ENV.fetch("RUNNER_TEMP"), "app.smarttube.fdroid.yml")
+          metadata = YAML.load_file(path)
+          build = metadata.fetch("Builds").last
+
+          puts "version=#{build.fetch("versionName")}"
+          puts "version_code=#{build.fetch("versionCode")}"
+          puts "commit=#{build.fetch("commit")}"
+          puts "subdir=#{build.fetch("subdir")}"
+          RUBY
+
+      - name: Check version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          local_version="${{ steps.local.outputs.version }}"
+          fdroid_version="${{ steps.fdroid.outputs.version }}"
+
+          if [[ "$local_version" == "$fdroid_version" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: $fdroid_version"
+            exit 0
+          fi
+
+          newest="$(printf '%s\n%s\n' "$local_version" "$fdroid_version" | sort -V | tail -n 1)"
+
+          if [[ "$newest" != "$fdroid_version" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::F-Droid version $fdroid_version is older than local version $local_version."
+            exit 0
+          fi
+
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream source
+        if: steps.version.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            "$UPSTREAM_REPO" \
+            "$RUNNER_TEMP/smarttube"
+
+          cd "$RUNNER_TEMP/smarttube"
+
+          git fetch \
+            --depth=1 \
+            origin \
+            "${{ steps.fdroid.outputs.commit }}"
+
+          git checkout --detach "${{ steps.fdroid.outputs.commit }}"
+
+          git submodule update \
+            --init \
+            --recursive \
+            --depth=1
+
+      - name: Set up Java 17
+        if: steps.version.outputs.build == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        if: steps.version.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          if [[ ! -x "$sdkmanager" ]]; then
+            echo "::error::sdkmanager not found."
+            exit 1
+          fi
+
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" --install \
+            "platform-tools" \
+            "platforms;$ANDROID_PLATFORM" \
+            "build-tools;$ANDROID_BUILD_TOOLS" \
+            "ndk;$ANDROID_NDK_VERSION"
+
+          yes | "$sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+
+      - name: Validate F-Droid build configuration
+        if: steps.version.outputs.build == 'true'
+        working-directory: ${{ runner.temp }}/smarttube
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f gradlew
+          test -f smarttubetv/build.gradle
+          test -f smarttubetv/src/stfdroid/res/values/strings.xml
+
+          grep -Fq 'ndkVersion "21.0.6113669"' smarttubetv/build.gradle
+          grep -Fq 'applicationId "app.smarttube.fdroid"' smarttubetv/build.gradle
+          grep -Fq 'stfdroid {' smarttubetv/build.gradle
+          grep -Fq 'universalApk true' smarttubetv/build.gradle
+
+      - name: Apply F-Droid build modifications
+        if: steps.version.outputs.build == 'true'
+        working-directory: ${{ runner.temp }}/smarttube
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf \
+            SharedModules/j2v8/src/main/jniLibs \
+            MediaServiceCore/SharedModules/j2v8/src/main/jniLibs \
+            exoplayer-amzn-2.10.6/extensions/cast \
+            exoplayer-amzn-2.10.6/extensions/ima
+
+          cd smarttubetv
+
+          sed -i \
+            -e '/firebase-crashlytics:/,+2d' \
+            -e '/firebase/d' \
+            build.gradle
+
+      - name: Apply local branding
+        if: steps.version.outputs.build == 'true'
+        working-directory: ${{ runner.temp }}/smarttube
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          local_res="$GITHUB_WORKSPACE/smarttubetv/src/stfdroid/res"
+          upstream_res="$PWD/smarttubetv/src/stfdroid/res"
+
+          test -d "$local_res"
+          test -d "$upstream_res"
+
+          cp -a "$local_res/." "$upstream_res/"
+
+          strings="$upstream_res/values/strings.xml"
+
+          test -f "$strings"
+
+          sed -i 's/SmartTube F-Droid/SmartTube/g' "$strings"
+
+      - name: Add x86_64 ABI
+        if: steps.version.outputs.build == 'true'
+        working-directory: ${{ runner.temp }}/smarttube
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("smarttubetv/build.gradle")
+          text = path.read_text()
+
+          old_split = "include 'armeabi-v7a', 'arm64-v8a', 'x86'"
+          new_split = "include 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'"
+
+          if text.count(old_split) != 1:
+              raise SystemExit("Expected ABI split definition not found exactly once.")
+
+          text = text.replace(old_split, new_split, 1)
+
+          old_filter = "abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86'"
+          new_filter = "abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'"
+
+          if text.count(old_filter) != 1:
+              raise SystemExit("Expected stfdroid ABI filter not found exactly once.")
+
+          text = text.replace(old_filter, new_filter, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Configure signing
+        if: steps.version.outputs.build == 'true'
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_PASSWORD"
+          test -n "$ANDROID_KEYSTORE_BASE64"
+
+          keystore="$RUNNER_TEMP/android-release.jks"
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+
+          chmod 600 "$keystore"
+
+          keytool \
+            -list \
+            -keystore "$keystore" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" \
+            >/dev/null
+
+          cat > "$RUNNER_TEMP/smarttube/keystore.properties" <<EOF
+          storeFile=$keystore
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+
+          chmod 600 "$RUNNER_TEMP/smarttube/keystore.properties"
+
+      - name: Build
+        if: steps.version.outputs.build == 'true'
+        working-directory: ${{ runner.temp }}/smarttube
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x gradlew
+
+          ./gradlew \
+            --no-daemon \
+            clean \
+            assembleStfdroidRelease
+
+      - name: Collect APKs
+        if: steps.version.outputs.build == 'true'
+        working-directory: ${{ runner.temp }}/smarttube
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          output_dir="smarttubetv/build/outputs/apk/stfdroid/release"
+
+          if [[ ! -d "$output_dir" ]]; then
+            echo "::error::APK output directory does not exist: $output_dir"
+            exit 1
+          fi
+
+          mapfile -t apks < <(
+            find "$output_dir" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.apk' \
+              -print
+          )
+
+          echo "APK files produced by Gradle:"
+          printf '  %s\n' "${apks[@]}"
+
+          if [[ "${#apks[@]}" -ne 5 ]]; then
+            echo "::error::Expected exactly 5 APKs, found ${#apks[@]}."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/release"
+
+          cp "${apks[@]}" "$GITHUB_WORKSPACE/release/"
+
+          echo
+          echo "APKs copied to release:"
+          find "$GITHUB_WORKSPACE/release" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.apk' \
+            -printf '  %f\n' \
+            | sort
+
+      - name: Verify APKs
+        if: steps.version.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aapt="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt"
+          apksigner="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+
+          expected_version="${{ steps.fdroid.outputs.version }}"
+          expected_code="${{ steps.fdroid.outputs.version_code }}"
+
+          mapfile -t apks < <(
+            find "$GITHUB_WORKSPACE/release" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.apk' \
+              -print
+          )
+
+          if [[ "${#apks[@]}" -ne 5 ]]; then
+            echo "::error::Expected 5 APKs, found ${#apks[@]}."
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            filename="$(basename "$apk")"
+
+            echo "Verifying $filename"
+
+            if ! "$apksigner" verify "$apk" >/dev/null 2>"$RUNNER_TEMP/apksigner-error"; then
+              cat "$RUNNER_TEMP/apksigner-error"
+              echo "::error::APK signature verification failed: $filename"
+              exit 1
+            fi
+
+            package="$(
+              "$aapt" dump badging "$apk" |
+              sed -n "s/^package: name='\([^']*\)'.*/\1/p"
+            )"
+
+            version="$(
+              "$aapt" dump badging "$apk" |
+              sed -n "s/.*versionName='\([^']*\)'.*/\1/p"
+            )"
+
+            version_code="$(
+              "$aapt" dump badging "$apk" |
+              sed -n "s/.*versionCode='\([^']*\)'.*/\1/p"
+            )"
+
+            label="$(
+              "$aapt" dump badging "$apk" |
+              sed -n "s/.*application-label:'\([^']*\)'.*/\1/p"
+            )"
+
+            if [[ "$package" != "app.smarttube.fdroid" ]]; then
+              echo "::error::$filename has unexpected package: $package"
+              exit 1
+            fi
+
+            if [[ "$version" != "$expected_version" ]]; then
+              echo "::error::$filename has version $version, expected $expected_version."
+              exit 1
+            fi
+
+            if [[ "$version_code" != "$expected_code" ]]; then
+              echo "::error::$filename has version code $version_code, expected $expected_code."
+              exit 1
+            fi
+
+            if [[ "$label" != "SmartTube" ]]; then
+              echo "::error::$filename has application label '$label', expected 'SmartTube'."
+              exit 1
+            fi
+
+            case "$filename" in
+              *_armeabi-v7a.apk)
+                expected_abis=(armeabi-v7a)
+                ;;
+
+              *_arm64-v8a.apk)
+                expected_abis=(arm64-v8a)
+                ;;
+
+              *_x86.apk)
+                expected_abis=(x86)
+                ;;
+
+              *_x86_64.apk)
+                expected_abis=(x86_64)
+                ;;
+
+              *_universal.apk)
+                expected_abis=(armeabi-v7a arm64-v8a x86 x86_64)
+                ;;
+
+              *)
+                echo "::error::Unexpected APK filename: $filename"
+                exit 1
+                ;;
+            esac
+
+            for abi in "${expected_abis[@]}"; do
+              if ! unzip -l "$apk" | grep -qE "lib/$abi/[^/]+\.so$"; then
+                echo "::error::$filename does not contain native libraries for $abi."
+                exit 1
+              fi
+            done
+
+            echo "Verified $filename"
+          done
+
+          echo
+          echo "All 5 APKs verified successfully."
+
+      - name: Release
+        if: steps.version.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ steps.fdroid.outputs.version }}"
+          version_code="${{ steps.fdroid.outputs.version_code }}"
+          commit="${{ steps.fdroid.outputs.commit }}"
+          tag="${version}"
+
+          upstream_tag="${version}s"
+
+          changelog="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/yuliskov/SmartTube/releases/tags/${upstream_tag}" |
+            jq -r '.body // empty' |
+            awk '/^Downloader code:/ { exit } { print }'
+          )"
+
+          if [[ -z "$changelog" ]]; then
+            changelog="*No changelog was provided by upstream.*"
+          fi
+
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$version" \
+            --notes "$changelog" \
+            --latest \
+            "$GITHUB_WORKSPACE"/release/*.apk

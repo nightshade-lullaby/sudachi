@@ -6,8 +6,8 @@
   </a>
 </p>
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/nightshade-lullaby/sudachi/.github/workflows/build.yml?logo=github)](https://github.com/nightshade-lullaby/sudachi/actions/workflows/build.yml)
-[![Downstream Release Tag](https://img.shields.io/github/v/release/nightshade-lullaby/sudachi?color=2C1A22)](https://github.com/nightshade-lullaby/sudachi/releases/latest)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/nightshade-lullaby/sudachi/.github/workflows/build.yml)](https://github.com/nightshade-lullaby/sudachi/actions/workflows/build.yml)
+[![Downstream Release Tag](https://img.shields.io/github/v/release/nightshade-lullaby/sudachi?logo=github&color=2C1A22)](https://github.com/nightshade-lullaby/sudachi/releases/latest)
 [![Upstream Release Tag](https://img.shields.io/f-droid/v/app.smarttube.fdroid?logo=fdroid&logoColor=B2EB0C)](https://f-droid.org/packages/app.smarttube.fdroid/)
 
 ---

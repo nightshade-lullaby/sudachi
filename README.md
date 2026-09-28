@@ -12,4 +12,10 @@
 
 ---
 
-placeholder for now
+This repository contains an automated workflow to build and release an F-Droid variant of the [SmartTube](https://github.com/yuliskov/smarttube) application.
+
+Build pipeline is **partially** replicated, however app functionality should remain identical.
+
+No affiliation with the original author(s).
+
+---

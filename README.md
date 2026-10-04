@@ -17,5 +17,3 @@ This repository contains an automated workflow to build and release an F-Droid v
 Build pipeline is **partially** replicated, however app functionality should remain identical.
 
 No affiliation with the original author(s).
-
----
